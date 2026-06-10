@@ -23,7 +23,7 @@ import {
   ChevronRight,
   Maximize2
 } from "lucide-react";
-import { checkGitStatus, applyCommits, CommitDay } from "./actions";
+import { checkGitStatus, applyCommits, CommitDay, validateGitHubToken, createGitHubRepoAndPush } from "./actions";
 
 // 5x5 / 5x3 character matrices for drawing text on the 7-row grid (placed on rows 1-5, leaving rows 0 and 6 as padding)
 const font: Record<string, number[][]> = {
@@ -348,7 +348,7 @@ export default function HackGitHome() {
   const [autoCenter, setAutoCenter] = useState(true);
 
   // Tab management
-  const [activeTab, setActiveTab] = useState<"local" | "scripts" | "io">("local");
+  const [activeTab, setActiveTab] = useState<"local" | "github" | "scripts" | "io">("github");
 
   // Local repo git status
   const [gitStatus, setGitStatus] = useState<{
@@ -364,6 +364,24 @@ export default function HackGitHome() {
   const [isCommitting, setIsCommitting] = useState(false);
   const [commitSuccess, setCommitSuccess] = useState<boolean | null>(null);
   const [commitMessage, setCommitMessage] = useState("");
+
+  // GitHub integration states
+  const [ghToken, setGhToken] = useState("");
+  const [ghUser, setGhUser] = useState<{
+    username: string;
+    name: string;
+    email: string;
+    avatarUrl: string;
+  } | null>(null);
+  const [ghRepoName, setGhRepoName] = useState("hackgit-contributions");
+  const [isGHAuthenticating, setIsGHAuthenticating] = useState(false);
+  const [isGHPushing, setIsGHPushing] = useState(false);
+  const [ghPushResult, setGhPushResult] = useState<{
+    success: boolean;
+    repoUrl?: string;
+    isExisting?: boolean;
+    error?: string;
+  } | null>(null);
   
   // UI preferences
   const [isDarkMode, setIsDarkMode] = useState(true);
@@ -371,11 +389,23 @@ export default function HackGitHome() {
   const [copiedPowerShell, setCopiedPowerShell] = useState(false);
   const [showHowTo, setShowHowTo] = useState(false);
 
+  // Year Selection
+  const [selectedYear, setSelectedYear] = useState<string>("current");
+
+  const getStartSunday = useCallback((yearOpt: string) => {
+    if (yearOpt === "current") {
+      return moment().startOf("week").subtract(52, "weeks");
+    } else {
+      const yearNum = parseInt(yearOpt, 10);
+      return moment().year(yearNum).month(0).date(1).startOf("week");
+    }
+  }, []);
+
   // Date alignment
-  const startSunday = moment().startOf("week").subtract(52, "weeks");
+  const startSunday = getStartSunday(selectedYear);
   const today = moment();
 
-  // Load theme preference on mount
+  // Load theme preference and GitHub session on mount
   useEffect(() => {
     const isDark = document.documentElement.classList.contains("dark") || 
                    (!("theme" in localStorage) && window.matchMedia("(prefers-color-scheme: dark)").matches);
@@ -386,6 +416,16 @@ export default function HackGitHome() {
       document.documentElement.classList.remove("dark");
     }
     fetchGitStatus();
+
+    // Retrieve saved GitHub session
+    const savedToken = localStorage.getItem("gh_token");
+    const savedUser = localStorage.getItem("gh_user");
+    if (savedToken) setGhToken(savedToken);
+    if (savedUser) {
+      try {
+        setGhUser(JSON.parse(savedUser));
+      } catch (e) {}
+    }
   }, []);
 
   const toggleTheme = () => {
@@ -403,6 +443,54 @@ export default function HackGitHome() {
   const fetchGitStatus = async () => {
     const status = await checkGitStatus();
     setGitStatus(status);
+  };
+
+  const handleGHAuthenticate = async () => {
+    if (!ghToken.trim()) return;
+    setIsGHAuthenticating(true);
+    try {
+      const result = await validateGitHubToken(ghToken);
+      if (result.success && result.user) {
+        setGhUser(result.user);
+        localStorage.setItem("gh_token", ghToken.trim());
+        localStorage.setItem("gh_user", JSON.stringify(result.user));
+      } else {
+        alert(result.error || "Failed to authenticate with GitHub.");
+      }
+    } catch (e: any) {
+      alert(e.message || "An error occurred during authentication.");
+    } finally {
+      setIsGHAuthenticating(false);
+    }
+  };
+
+  const handleGHDisconnect = () => {
+    setGhToken("");
+    setGhUser(null);
+    localStorage.removeItem("gh_token");
+    localStorage.removeItem("gh_user");
+    setGhPushResult(null);
+  };
+
+  const handleGHPush = async () => {
+    if (!ghUser || !ghToken || activeCells.length === 0) return;
+    setIsGHPushing(true);
+    setGhPushResult(null);
+    try {
+      const result = await createGitHubRepoAndPush(
+        ghToken,
+        ghUser.username,
+        ghUser.email,
+        ghRepoName,
+        activeCells,
+        selectedYear
+      );
+      setGhPushResult(result);
+    } catch (e: any) {
+      setGhPushResult({ success: false, error: e.message || "Failed to push commits to GitHub." });
+    } finally {
+      setIsGHPushing(false);
+    }
   };
 
   // Check if cell corresponds to a future date
@@ -656,7 +744,7 @@ export default function HackGitHome() {
     setCommitMessage("Connecting to local git and generating commits...");
 
     try {
-      const result = await applyCommits(activeCells);
+      const result = await applyCommits(activeCells, selectedYear);
       if (result.success) {
         setCommitSuccess(true);
         setCommitMessage(`Successfully applied ${result.count} backdated commits to your local repository! Check git log.`);
@@ -873,717 +961,789 @@ Write-Host "👉 Run 'git push origin <branch>' to push commits." -ForegroundCol
   const monthLabels = getMonthHeaderLabels();
 
   return (
-    <div className="flex-1 bg-zinc-50 text-zinc-900 font-sans transition-colors duration-200 dark:bg-black dark:text-zinc-50 py-10 px-4 md:px-8">
-      <div className="max-w-6xl mx-auto flex flex-col gap-8">
+    <div className="dark flex-1 bg-black text-zinc-50 font-sans py-7 px-7 select-none min-h-screen flex flex-col justify-start">
+      <div className="max-w-[1400px] mx-auto flex flex-col gap-5 w-full">
         
         {/* HEADER SECTION */}
-        <header className="flex flex-col md:flex-row md:items-center justify-between border-b border-zinc-200 dark:border-zinc-900 pb-6 gap-4">
+        <header className="flex items-center justify-between border-b border-zinc-900 pb-4">
           <div className="flex items-center gap-3">
-            <div className="p-2 bg-zinc-900 text-white dark:bg-white dark:text-black rounded-lg">
+            <div className="p-2 bg-white text-black rounded">
               <GitCommit className="h-6 w-6 animate-pulse" />
             </div>
             <div>
-              <h1 className="text-2xl font-bold tracking-tight font-mono">hackgit</h1>
-              <p className="text-xs text-zinc-500 dark:text-zinc-400">
+              <h1 className="text-lg font-bold tracking-tight font-mono text-white leading-none">hackgit</h1>
+              <p className="text-[13px] text-zinc-400 mt-0.5">
                 Replica GitHub Contribution Editor & Commit Planner
               </p>
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2.5">
             <button
               onClick={() => setShowHowTo(!showHowTo)}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-zinc-200 dark:border-zinc-800 rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-900 transition-colors"
+              className="flex items-center gap-1.5 px-3.5 py-1.5 text-sm border border-zinc-800 rounded hover:bg-zinc-900 transition-colors text-zinc-400 hover:text-zinc-100 font-mono"
             >
-              <HelpCircle className="h-3.5 w-3.5" />
+              <HelpCircle className="h-4 w-4" />
               How it works
             </button>
             <button
               onClick={toggleTheme}
-              className="p-2 border border-zinc-200 dark:border-zinc-800 rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-900 transition-colors"
+              className="p-2 border border-zinc-800 rounded hover:bg-zinc-900 transition-colors text-zinc-400 hover:text-zinc-100"
               aria-label="Toggle Theme"
             >
-              {isDarkMode ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+              {isDarkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </button>
           </div>
         </header>
 
         {/* HOW IT WORKS GUIDELINES */}
         {showHowTo && (
-          <div className="bg-zinc-100 dark:bg-zinc-900/50 border border-zinc-200 dark:border-zinc-800/80 rounded-lg p-5 text-sm flex gap-4 leading-relaxed transition-all">
-            <Info className="h-5 w-5 text-zinc-500 dark:text-zinc-400 shrink-0 mt-0.5" />
+          <div className="bg-zinc-950 border border-zinc-900 rounded p-5 text-sm flex gap-4 leading-relaxed transition-all">
+            <Info className="h-5 w-5 text-zinc-400 shrink-0 mt-0.5" />
             <div className="flex flex-col gap-2">
-              <h3 className="font-semibold text-zinc-950 dark:text-zinc-50">How hackgit works:</h3>
-              <ol className="list-decimal pl-4 flex flex-col gap-1.5 text-zinc-600 dark:text-zinc-400">
+              <h3 className="font-semibold text-zinc-200 text-sm">How hackgit works:</h3>
+              <ol className="list-decimal pl-5 flex flex-col gap-1.5 text-zinc-400">
                 <li>
-                  <strong>Draw:</strong> Choose a level intensity (shades of green) or tool type. Click and drag on the contribution matrix below to design your graph.
+                  <strong>Draw:</strong> Choose brush level and drag on the calendar grid to draw your contribution pattern.
                 </li>
                 <li>
-                  <strong>Type:</strong> Use the Text Tool in the panel to instantly write monospaced letters or numbers onto the calendar.
+                  <strong>Type:</strong> Use the Text Drawer below to automatically render words onto the calendar.
                 </li>
                 <li>
-                  <strong>Apply:</strong> 
-                  <ul className="list-disc pl-5 mt-1 flex flex-col gap-0.5">
-                    <li><em>Locally:</em> Run commits directly into this local git repository via Server Actions.</li>
-                    <li><em>Scripting:</em> Copy or download the generated Bash or PowerShell scripts to run inside any other git repository on your computer.</li>
-                  </ul>
-                </li>
-                <li>
-                  <strong>Push:</strong> Once commits are generated, run <code>git push origin main</code> to upload the commit history to your remote GitHub profile!
+                  <strong>Apply:</strong> Connect your token to push directly to a new repository, apply to local repo, or download scripts.
                 </li>
               </ol>
             </div>
           </div>
         )}
 
-        {/* WORKSPACE & CONTROLS GRID */}
-        <div className="grid grid-cols-1 lg:grid-cols-4 gap-8">
-          
-          {/* LEFT COLUMN: HEATMAP GRID & LEGEND */}
-          <div className="lg:col-span-3 flex flex-col gap-4">
+        {/* HEATMAP CONTAINER (Full Width) */}
+        <div className="border border-zinc-900 bg-zinc-955 p-5 rounded-lg shadow-sm">
+          <div className="flex flex-col gap-3">
             
-            {/* HEATMAP CONTAINER */}
-            <div className="border border-zinc-200 dark:border-zinc-900 bg-white dark:bg-zinc-950 p-6 rounded-lg shadow-sm">
-              <div className="flex flex-col">
+            {/* HEATMAP HEADER (Year Selector, Invert, Clear) */}
+            <div className="flex items-center justify-between border-b border-zinc-900 pb-2.5">
+              <span className="text-sm font-bold font-mono tracking-wider uppercase text-zinc-400">Contribution Calendar</span>
+              
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={invertGrid}
+                  className="px-3 py-1.5 border border-zinc-800 bg-zinc-900 hover:bg-zinc-800 rounded text-sm font-mono text-zinc-300 hover:text-white transition-colors"
+                >
+                  Invert
+                </button>
+                <button
+                  onClick={clearGrid}
+                  className="px-3 py-1.5 border border-rose-900 bg-rose-950/20 hover:bg-rose-950/40 text-rose-400 rounded text-sm font-mono transition-colors flex items-center gap-1"
+                >
+                  <Trash2 className="h-4 w-4" />
+                  Clear
+                </button>
+
+                <div className="h-5 border-r border-zinc-800 mx-2"></div>
+
+                <label htmlFor="year-select" className="text-sm text-zinc-500 font-mono">Year:</label>
+                <select
+                  id="year-select"
+                  value={selectedYear}
+                  onChange={(e) => setSelectedYear(e.target.value)}
+                  className="px-2.5 py-1.5 border border-zinc-800 bg-zinc-900 rounded text-sm font-mono focus:outline-none focus:border-zinc-700 text-white cursor-pointer"
+                >
+                  <option value="current">Last 12 Months</option>
+                  <option value="2026">2026</option>
+                  <option value="2025">2025</option>
+                  <option value="2024">2024</option>
+                  <option value="2023">2023</option>
+                  <option value="2022">2022</option>
+                </select>
+              </div>
+            </div>
+
+            {/* Scrollable calendar view to preserve exact dimensions */}
+            <div className="overflow-x-auto pb-1.5 -mx-4 px-4 md:mx-0 md:px-0 scrollbar-thin">
+              <div className="min-w-[800px] flex flex-col items-center select-none">
                 
-                {/* Scrollable calendar view to preserve exact dimensions */}
-                <div className="overflow-x-auto pb-2 -mx-4 px-4 md:mx-0 md:px-0">
-                  <div className="min-w-[670px] flex flex-col items-center py-2 select-none">
-                    
-                    {/* MONTH LABELS ROW */}
-                    <div 
-                      className="relative h-4 mb-1 select-none text-[9px] text-zinc-400 dark:text-zinc-500 font-mono"
-                      style={{
-                        width: "666px"
-                      }}
+                {/* MONTH LABELS ROW */}
+                <div 
+                  className="relative h-5 select-none text-[12px] text-zinc-500 font-mono"
+                  style={{ width: "776px" }}
+                >
+                  {monthLabels.map((lbl, idx) => (
+                    <span
+                      key={idx}
+                      style={{ left: `${36 + lbl.colIndex * 14}px` }}
+                      className="absolute whitespace-nowrap"
                     >
-                      {monthLabels.map((lbl, idx) => (
-                        <span
-                          key={idx}
-                          style={{ left: `${32 + lbl.colIndex * 12}px` }}
-                          className="absolute whitespace-nowrap"
-                        >
-                          {lbl.text}
-                        </span>
-                      ))}
-                    </div>
-
-                    {/* GRAPH MATRIX AND WEEKDAYS */}
-                    <div 
-                      className="flex items-center"
-                      style={{
-                        width: "666px"
-                      }}
-                    >
-                      {/* WEEKDAY LABELS (30px width) */}
-                      <div 
-                        className="grid grid-rows-7 text-[9px] text-zinc-400 dark:text-zinc-500 font-mono pr-2 select-none"
-                        style={{
-                          height: "82px",
-                          gridTemplateRows: "repeat(7, 10px)",
-                          gap: "2px",
-                          width: "30px"
-                        }}
-                      >
-                        <span></span>
-                        <span className="leading-[10px] h-[10px] flex items-center">Mon</span>
-                        <span></span>
-                        <span className="leading-[10px] h-[10px] flex items-center">Wed</span>
-                        <span></span>
-                        <span className="leading-[10px] h-[10px] flex items-center">Fri</span>
-                        <span></span>
-                      </div>
-
-                      {/* 53 COLUMNS X 7 ROWS FLAT GRID */}
-                      <div 
-                        className="grid grid-flow-col gap-[2px] relative cursor-crosshair select-none"
-                        onMouseLeave={() => setIsDrawing(false)}
-                        style={{
-                          gridTemplateColumns: "repeat(53, 10px)",
-                          gridTemplateRows: "repeat(7, 10px)",
-                          width: "634px",
-                          height: "82px"
-                        }}
-                      >
-                        {Array.from({ length: 53 * 7 }).map((_, index) => {
-                          const x = Math.floor(index / 7);
-                          const y = index % 7;
-                          const key = `${x},${y}`;
-                          const val = grid[key] || 0;
-                          const future = isFutureDate(x, y);
-                          const cellDate = startSunday.clone().add(x, "weeks").add(y, "days");
-                          const commitsCount = [0, 1, 3, 6, 10][val];
-
-                          // GitHub Color mapping classes
-                          let cellColorClass = "";
-                          if (isDarkMode) {
-                            cellColorClass = 
-                              val === 1 ? "bg-[#0e4429]" :
-                              val === 2 ? "bg-[#006d32]" :
-                              val === 3 ? "bg-[#26a641]" :
-                              val === 4 ? "bg-[#39d353]" : "bg-[#161b22]";
-                          } else {
-                            cellColorClass = 
-                              val === 1 ? "bg-[#9be9a8]" :
-                              val === 2 ? "bg-[#40c463]" :
-                              val === 3 ? "bg-[#30a14e]" :
-                              val === 4 ? "bg-[#216e39]" : "bg-[#ebedf0]";
-                          }
-
-                          return (
-                            <div
-                              key={index}
-                              onMouseDown={() => handleMouseDown(x, y)}
-                              onMouseEnter={() => handleMouseEnter(x, y)}
-                              className={`
-                                w-[10px] h-[10px] rounded-[2px] border border-transparent 
-                                transition-all duration-75 relative group
-                                ${cellColorClass}
-                                ${future ? "opacity-25 cursor-not-allowed border-dashed border-zinc-350 dark:border-zinc-800" : "hover:scale-110 hover:border-zinc-950 dark:hover:border-white"}
-                              `}
-                            >
-                              {/* Custom Tooltip */}
-                              <div className="absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 hidden group-hover:block z-30 bg-zinc-900 text-white dark:bg-white dark:text-black text-[10px] px-2 py-1 rounded shadow-md whitespace-nowrap font-mono">
-                                {future ? (
-                                  "Future Date"
-                                ) : (
-                                  <>
-                                    {commitsCount} commit{commitsCount !== 1 ? "s" : ""} on {cellDate.format("MMM DD, YYYY")}
-                                  </>
-                                )}
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-
-                  </div>
+                      {lbl.text}
+                    </span>
+                  ))}
                 </div>
 
-                {/* GRAPH FOOTER & LEGEND */}
-                <div className="flex items-center justify-between border-t border-zinc-100 dark:border-zinc-900 mt-5 pt-4 text-xs text-zinc-500 dark:text-zinc-400">
-                  <div className="flex gap-4">
-                    <span>Active blocks: <strong>{activeCells.length}</strong></span>
-                    <span>Total commits: <strong>{totalCommits}</strong></span>
+                {/* GRAPH MATRIX AND WEEKDAYS */}
+                <div className="flex items-center" style={{ width: "776px" }}>
+                  {/* WEEKDAY LABELS (36px width) */}
+                  <div 
+                    className="grid grid-rows-7 text-[12px] text-zinc-500 font-mono pr-3 select-none"
+                    style={{
+                      height: "96px",
+                      gridTemplateRows: "repeat(7, 12px)",
+                      gap: "2px",
+                      width: "36px"
+                    }}
+                  >
+                    <span></span>
+                    <span className="leading-[12px] h-[12px] flex items-center">Mon</span>
+                    <span></span>
+                    <span className="leading-[12px] h-[12px] flex items-center">Wed</span>
+                    <span></span>
+                    <span className="leading-[12px] h-[12px] flex items-center">Fri</span>
+                    <span></span>
                   </div>
-                  
-                  {/* COLOR KEY */}
-                  <div className="flex items-center gap-[2px] text-[9px] font-mono">
-                    <span className="mr-1 text-zinc-400">Less</span>
-                    <div className={`w-[10px] h-[10px] rounded-[2px] ${isDarkMode ? "bg-[#161b22]" : "bg-[#ebedf0]"}`}></div>
-                    <div className={`w-[10px] h-[10px] rounded-[2px] ${isDarkMode ? "bg-[#0e4429]" : "bg-[#9be9a8]"}`}></div>
-                    <div className={`w-[10px] h-[10px] rounded-[2px] ${isDarkMode ? "bg-[#006d32]" : "bg-[#40c463]"}`}></div>
-                    <div className={`w-[10px] h-[10px] rounded-[2px] ${isDarkMode ? "bg-[#26a641]" : "bg-[#30a14e]"}`}></div>
-                    <div className={`w-[10px] h-[10px] rounded-[2px] ${isDarkMode ? "bg-[#39d353]" : "bg-[#216e39]"}`}></div>
-                    <span className="ml-1 text-zinc-400">More</span>
+
+                  {/* 53 COLUMNS X 7 ROWS FLAT GRID */}
+                  <div 
+                    className="grid grid-flow-col gap-[2px] relative cursor-crosshair select-none"
+                    onMouseLeave={() => setIsDrawing(false)}
+                    style={{
+                      gridTemplateColumns: "repeat(53, 12px)",
+                      gridTemplateRows: "repeat(7, 12px)",
+                      width: "740px",
+                      height: "96px"
+                    }}
+                  >
+                    {Array.from({ length: 53 * 7 }).map((_, index) => {
+                      const x = Math.floor(index / 7);
+                      const y = index % 7;
+                      const key = `${x},${y}`;
+                      const val = grid[key] || 0;
+                      const future = isFutureDate(x, y);
+                      const cellDate = startSunday.clone().add(x, "weeks").add(y, "days");
+                      const commitsCount = [0, 1, 3, 6, 10][val];
+
+                      let cellColorClass = 
+                        val === 1 ? "bg-[#0e4429]" :
+                        val === 2 ? "bg-[#006d32]" :
+                        val === 3 ? "bg-[#26a641]" :
+                        val === 4 ? "bg-[#39d353]" : "bg-[#161b22]";
+
+                      return (
+                        <div
+                          key={index}
+                          onMouseDown={() => handleMouseDown(x, y)}
+                          onMouseEnter={() => handleMouseEnter(x, y)}
+                          className={`
+                            w-[12px] h-[12px] rounded-[2px] border border-transparent 
+                            transition-all duration-75 relative group
+                            ${cellColorClass}
+                            ${future ? "opacity-25 cursor-not-allowed border-dashed border-zinc-850" : "hover:scale-110 hover:border-white"}
+                          `}
+                        >
+                          <div className="absolute bottom-full left-1/2 transform -translate-x-1/2 mb-3 hidden group-hover:block z-30 bg-zinc-900 text-white text-sm px-3 py-2 rounded shadow-md whitespace-nowrap font-mono">
+                            {future ? "Future Date" : `${commitsCount} commit${commitsCount !== 1 ? "s" : ""} on ${cellDate.format("MMM DD, YYYY")}`}
+                          </div>
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
 
               </div>
             </div>
 
-            {/* TAB CONFIGURE & ACTION PANELS */}
-            <div className="border border-zinc-200 dark:border-zinc-900 bg-white dark:bg-zinc-950 rounded-lg overflow-hidden">
-              
-              {/* TAB SELECTOR */}
-              <div className="flex border-b border-zinc-200 dark:border-zinc-900 bg-zinc-50 dark:bg-zinc-900/30">
-                <button
-                  onClick={() => setActiveTab("local")}
-                  className={`flex-1 md:flex-initial flex items-center justify-center gap-2 px-5 py-3 text-xs font-semibold tracking-wider font-mono uppercase border-b-2 transition-all ${
-                    activeTab === "local"
-                      ? "border-black dark:border-white text-black dark:text-white bg-white dark:bg-zinc-950"
-                      : "border-transparent text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100"
-                  }`}
-                >
-                  <RefreshCw className="h-3.5 w-3.5" />
-                  Local Repository
-                </button>
-                <button
-                  onClick={() => setActiveTab("scripts")}
-                  className={`flex-1 md:flex-initial flex items-center justify-center gap-2 px-5 py-3 text-xs font-semibold tracking-wider font-mono uppercase border-b-2 transition-all ${
-                    activeTab === "scripts"
-                      ? "border-black dark:border-white text-black dark:text-white bg-white dark:bg-zinc-950"
-                      : "border-transparent text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100"
-                  }`}
-                >
-                  <Terminal className="h-3.5 w-3.5" />
-                  Get Scripts
-                </button>
-                <button
-                  onClick={() => setActiveTab("io")}
-                  className={`flex-1 md:flex-initial flex items-center justify-center gap-2 px-5 py-3 text-xs font-semibold tracking-wider font-mono uppercase border-b-2 transition-all ${
-                    activeTab === "io"
-                      ? "border-black dark:border-white text-black dark:text-white bg-white dark:bg-zinc-950"
-                      : "border-transparent text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100"
-                  }`}
-                >
-                  <Download className="h-3.5 w-3.5" />
-                  Import / Export
-                </button>
+            {/* GRAPH FOOTER & LEGEND */}
+            <div className="flex items-center justify-between border-t border-zinc-900 pt-3 text-sm text-zinc-400">
+              <div className="flex gap-5">
+                <span>Active: <strong>{activeCells.length}</strong></span>
+                <span>Commits: <strong>{totalCommits}</strong></span>
               </div>
-
-              {/* TAB CONTENT */}
-              <div className="p-6">
-                
-                {/* TAB 1: LOCAL DIRECT COMMIT */}
-                {activeTab === "local" && (
-                  <div className="flex flex-col gap-6">
-                    <div className="flex flex-col gap-1.5">
-                      <h2 className="text-base font-semibold">Apply directly to this repository</h2>
-                      <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                        This action will write backdated git commits directly to this project folder.
-                      </p>
-                    </div>
-
-                    {/* LOCAL REPO STATUS */}
-                    <div className="bg-zinc-50 dark:bg-zinc-900/30 border border-zinc-200 dark:border-zinc-900 rounded-md p-4 flex flex-col md:flex-row md:items-center justify-between gap-4">
-                      <div className="flex flex-col gap-1 font-mono text-xs text-zinc-600 dark:text-zinc-400">
-                        <div className="flex items-center gap-1.5">
-                          <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
-                          <span>Repo: <strong className="text-zinc-900 dark:text-zinc-100">hackgit</strong></span>
-                        </div>
-                        {gitStatus?.success ? (
-                          <>
-                            <div>Branch: <strong className="text-zinc-900 dark:text-zinc-100">{gitStatus.branch}</strong></div>
-                            <div>Clean: <strong className="text-zinc-900 dark:text-zinc-100">{gitStatus.isClean ? "Yes" : "No (modified files exist)"}</strong></div>
-                          </>
-                        ) : (
-                          <div className="text-red-500">{gitStatus?.error || "Checking git status..."}</div>
-                        )}
-                      </div>
-                      <button
-                        onClick={fetchGitStatus}
-                        className="px-3 py-1 text-xs border border-zinc-200 dark:border-zinc-800 rounded hover:bg-zinc-100 dark:hover:bg-zinc-900 font-mono"
-                      >
-                        Refresh status
-                      </button>
-                    </div>
-
-                    <div className="bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-900/50 text-amber-800 dark:text-amber-300 rounded-md p-4 text-xs flex gap-3">
-                      <Info className="h-4.5 w-4.5 shrink-0" />
-                      <div className="flex flex-col gap-1">
-                        <strong className="font-semibold">Important Notes:</strong>
-                        <ul className="list-disc pl-4 flex flex-col gap-0.5">
-                          <li>It is recommended to run this on a separate branch if you do not want to mix commits into your main development branch.</li>
-                          <li>This process creates backdated empty/checkpoint files in <code>data.json</code> and commits them.</li>
-                          <li>After committing, you will need to push changes to your GitHub remote.</li>
-                        </ul>
-                      </div>
-                    </div>
-
-                    {/* RUN COMMIT BUTTON */}
-                    <div className="flex items-center gap-4">
-                      <button
-                        onClick={handleApplyCommits}
-                        disabled={isCommitting || activeCells.length === 0}
-                        className="px-6 py-2.5 bg-black text-white dark:bg-white dark:text-black font-semibold text-sm rounded-md transition-all hover:opacity-90 disabled:opacity-30 disabled:cursor-not-allowed flex items-center gap-2"
-                      >
-                        {isCommitting ? (
-                          <>
-                            <RefreshCw className="h-4 w-4 animate-spin" />
-                            Committing...
-                          </>
-                        ) : (
-                          <>
-                            <GitCommit className="h-4 w-4" />
-                            Apply {totalCommits} Commits
-                          </>
-                        )}
-                      </button>
-                      
-                      {activeCells.length === 0 && (
-                        <span className="text-xs text-zinc-500">Draw something on the grid above to start.</span>
-                      )}
-                    </div>
-
-                    {/* STATUS MESSAGE */}
-                    {commitMessage && (
-                      <div className={`p-4 rounded-md border text-xs font-mono leading-relaxed ${
-                        commitSuccess === true 
-                          ? "bg-emerald-50 dark:bg-emerald-950/20 border-emerald-200 dark:border-emerald-900/50 text-emerald-800 dark:text-emerald-400"
-                          : commitSuccess === false
-                          ? "bg-rose-50 dark:bg-rose-950/20 border-rose-200 dark:border-rose-900/50 text-rose-800 dark:text-rose-400"
-                          : "bg-zinc-100 dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 text-zinc-600 dark:text-zinc-400"
-                      }`}>
-                        {commitMessage}
-                      </div>
-                    )}
-
-                  </div>
-                )}
-
-                {/* TAB 2: EXPORT SCRIPTS */}
-                {activeTab === "scripts" && (
-                  <div className="flex flex-col gap-6">
-                    <div className="flex flex-col gap-1.5">
-                      <h2 className="text-base font-semibold">Generate contribution scripts</h2>
-                      <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                        Copy or download these scripts to execute the contribution commits inside any target Git repository on your machine.
-                      </p>
-                    </div>
-
-                    {activeCells.length === 0 ? (
-                      <div className="border border-dashed border-zinc-200 dark:border-zinc-800 rounded-lg p-10 text-center text-xs text-zinc-500 dark:text-zinc-400">
-                        Please select cells on the heatmap grid first to generate scripts.
-                      </div>
-                    ) : (
-                      <div className="flex flex-col gap-6">
-                        
-                        {/* BASH SCRIPT */}
-                        <div className="flex flex-col gap-2">
-                          <div className="flex items-center justify-between">
-                            <span className="text-xs font-bold tracking-wider uppercase font-mono text-zinc-500">Bash (macOS / Linux)</span>
-                            <div className="flex gap-2">
-                              <button
-                                onClick={() => copyToClipboard(getBashScriptText(), "bash")}
-                                className="flex items-center gap-1 px-2.5 py-1 text-[10px] border border-zinc-200 dark:border-zinc-800 hover:bg-zinc-100 dark:hover:bg-zinc-900 rounded font-mono"
-                              >
-                                {copiedBash ? <Check className="h-3 w-3 text-emerald-500" /> : <Copy className="h-3 w-3" />}
-                                {copiedBash ? "Copied" : "Copy"}
-                              </button>
-                              <button
-                                onClick={() => downloadScriptFile(getBashScriptText(), "hackgit-commits.sh")}
-                                className="flex items-center gap-1 px-2.5 py-1 text-[10px] border border-zinc-200 dark:border-zinc-800 hover:bg-zinc-100 dark:hover:bg-zinc-900 rounded font-mono"
-                              >
-                                <Download className="h-3 w-3" />
-                                Download
-                              </button>
-                            </div>
-                          </div>
-                          <pre className="p-4 bg-zinc-950 border border-zinc-900 rounded text-zinc-300 text-xs overflow-auto max-h-48 font-mono leading-relaxed select-all">
-                            {getBashScriptText()}
-                          </pre>
-                        </div>
-
-                        {/* POWERSHELL SCRIPT */}
-                        <div className="flex flex-col gap-2">
-                          <div className="flex items-center justify-between">
-                            <span className="text-xs font-bold tracking-wider uppercase font-mono text-zinc-500">PowerShell (Windows)</span>
-                            <div className="flex gap-2">
-                              <button
-                                onClick={() => copyToClipboard(getPowerShellScriptText(), "powershell")}
-                                className="flex items-center gap-1 px-2.5 py-1 text-[10px] border border-zinc-200 dark:border-zinc-800 hover:bg-zinc-100 dark:hover:bg-zinc-900 rounded font-mono"
-                              >
-                                {copiedPowerShell ? <Check className="h-3 w-3 text-emerald-500" /> : <Copy className="h-3 w-3" />}
-                                {copiedPowerShell ? "Copied" : "Copy"}
-                              </button>
-                              <button
-                                onClick={() => downloadScriptFile(getPowerShellScriptText(), "hackgit-commits.ps1")}
-                                className="flex items-center gap-1 px-2.5 py-1 text-[10px] border border-zinc-200 dark:border-zinc-800 hover:bg-zinc-100 dark:hover:bg-zinc-900 rounded font-mono"
-                              >
-                                <Download className="h-3 w-3" />
-                                Download
-                              </button>
-                            </div>
-                          </div>
-                          <pre className="p-4 bg-zinc-950 border border-zinc-900 rounded text-zinc-300 text-xs overflow-auto max-h-48 font-mono leading-relaxed select-all">
-                            {getPowerShellScriptText()}
-                          </pre>
-                        </div>
-
-                      </div>
-                    )}
-
-                  </div>
-                )}
-
-                {/* TAB 3: IMPORT/EXPORT JSON */}
-                {activeTab === "io" && (
-                  <div className="flex flex-col gap-6">
-                    <div className="flex flex-col gap-1.5">
-                      <h2 className="text-base font-semibold">Import & Export Grid Data</h2>
-                      <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                        Save your contribution patterns to a JSON file to reload or share them later.
-                      </p>
-                    </div>
-
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                      
-                      {/* EXPORT */}
-                      <div className="border border-zinc-200 dark:border-zinc-900 p-5 rounded-md flex flex-col gap-3">
-                        <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-400">Export State</h3>
-                        <p className="text-xs text-zinc-500 dark:text-zinc-400 leading-normal">
-                          Download the current grid selection as a JSON template file.
-                        </p>
-                        <button
-                          onClick={handleExportJSON}
-                          disabled={activeCells.length === 0}
-                          className="w-full py-2 border border-zinc-200 dark:border-zinc-800 rounded hover:bg-zinc-100 dark:hover:bg-zinc-900 transition-colors text-xs font-semibold flex items-center justify-center gap-2 disabled:opacity-30 disabled:cursor-not-allowed"
-                        >
-                          <Download className="h-3.5 w-3.5" />
-                          Download JSON Pattern
-                        </button>
-                      </div>
-
-                      {/* IMPORT */}
-                      <div className="border border-zinc-200 dark:border-zinc-900 p-5 rounded-md flex flex-col gap-3">
-                        <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-400">Import State</h3>
-                        <p className="text-xs text-zinc-500 dark:text-zinc-400 leading-normal">
-                          Load a previously saved JSON pattern file back onto the grid.
-                        </p>
-                        <label className="w-full py-2 border border-zinc-200 dark:border-zinc-800 rounded hover:bg-zinc-100 dark:hover:bg-zinc-900 transition-colors text-xs font-semibold flex items-center justify-center gap-2 cursor-pointer text-center">
-                          <Upload className="h-3.5 w-3.5" />
-                          <span>Upload JSON Pattern</span>
-                          <input
-                            type="file"
-                            accept=".json"
-                            onChange={handleImportJSON}
-                            className="hidden"
-                          />
-                        </label>
-                      </div>
-
-                    </div>
-
-                  </div>
-                )}
-
+              
+              {/* COLOR KEY */}
+              <div className="flex items-center gap-[4px] font-mono text-[12px]">
+                <span className="mr-1 text-zinc-500">Less</span>
+                <div className="w-[12px] h-[12px] rounded-[2px] bg-[#161b22]"></div>
+                <div className="w-[12px] h-[12px] rounded-[2px] bg-[#0e4429]"></div>
+                <div className="w-[12px] h-[12px] rounded-[2px] bg-[#006d32]"></div>
+                <div className="w-[12px] h-[12px] rounded-[2px] bg-[#26a641]"></div>
+                <div className="w-[12px] h-[12px] rounded-[2px] bg-[#39d353]"></div>
+                <span className="ml-1 text-zinc-500">More</span>
               </div>
             </div>
 
           </div>
+        </div>
 
-          {/* RIGHT COLUMN: PAINT & PRESET CONTROLS */}
-          <div className="flex flex-col gap-6">
-            
-            {/* PANEL: BRUSH & SHADE SELECTORS */}
-            <div className="border border-zinc-200 dark:border-zinc-900 bg-white dark:bg-zinc-950 p-6 rounded-lg shadow-sm flex flex-col gap-5">
-              
-              <div className="border-b border-zinc-100 dark:border-zinc-900 pb-3 flex items-center gap-2">
-                <Edit className="h-4 w-4" />
-                <h2 className="text-sm font-semibold tracking-wider uppercase font-mono">Tools & Shades</h2>
+        {/* 4-COLUMN CONTROL PANEL LAYOUT */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-5 items-stretch">
+          
+          {/* COLUMN 1: BRUSH TOOLS */}
+          <div className="border border-zinc-900 bg-zinc-950 p-5 rounded-lg shadow-sm flex flex-col gap-5">
+            <div className="border-b border-zinc-900 pb-2 flex items-center gap-2.5">
+              <Edit className="h-5 w-5 text-zinc-400" />
+              <h2 className="text-sm font-semibold tracking-wider uppercase font-mono text-zinc-200">Brush Tools</h2>
+            </div>
+
+            {/* BRUSH MODE */}
+            <div className="flex flex-col gap-2.5">
+              <span className="text-[13px] font-bold text-zinc-400">Brush Mode:</span>
+              <div className="grid grid-cols-3 gap-1.5 bg-zinc-900/60 p-1.5 rounded">
+                <button
+                  onClick={() => setTool("pencil")}
+                  className={`flex items-center justify-center gap-2 py-2.5 text-[12px] font-semibold rounded ${
+                    tool === "pencil" ? "bg-zinc-800 text-white shadow-sm" : "text-zinc-500 hover:text-zinc-200"
+                  }`}
+                >
+                  <Edit className="h-4 w-4" />
+                  Draw
+                </button>
+                <button
+                  onClick={() => setTool("eraser")}
+                  className={`flex items-center justify-center gap-2 py-2.5 text-[12px] font-semibold rounded ${
+                    tool === "eraser" ? "bg-zinc-800 text-white shadow-sm" : "text-zinc-500 hover:text-zinc-200"
+                  }`}
+                >
+                  <Eraser className="h-4 w-4" />
+                  Erase
+                </button>
+                <button
+                  onClick={() => setTool("cycle")}
+                  className={`flex items-center justify-center gap-2 py-2.5 text-[12px] font-semibold rounded ${
+                    tool === "cycle" ? "bg-zinc-800 text-white shadow-sm" : "text-zinc-500 hover:text-zinc-200"
+                  }`}
+                >
+                  <RefreshCw className="h-4 w-4" />
+                  Cycle
+                </button>
               </div>
+            </div>
 
-              {/* TOOL SELECTOR */}
-              <div className="flex flex-col gap-2">
-                <span className="text-xs font-bold text-zinc-400">Brush Mode:</span>
-                <div className="grid grid-cols-3 gap-1 bg-zinc-100 dark:bg-zinc-900/60 p-1 rounded-md">
-                  <button
-                    onClick={() => setTool("pencil")}
-                    className={`flex items-center justify-center gap-1.5 py-1.5 text-xs font-semibold rounded ${
-                      tool === "pencil"
-                        ? "bg-white dark:bg-zinc-950 text-black dark:text-white shadow-sm"
-                        : "text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200"
-                    }`}
-                  >
-                    <Edit className="h-3 w-3" />
-                    Draw
-                  </button>
-                  <button
-                    onClick={() => setTool("eraser")}
-                    className={`flex items-center justify-center gap-1.5 py-1.5 text-xs font-semibold rounded ${
-                      tool === "eraser"
-                        ? "bg-white dark:bg-zinc-950 text-black dark:text-white shadow-sm"
-                        : "text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200"
-                    }`}
-                  >
-                    <Eraser className="h-3 w-3" />
-                    Erase
-                  </button>
-                  <button
-                    onClick={() => setTool("cycle")}
-                    className={`flex items-center justify-center gap-1.5 py-1.5 text-xs font-semibold rounded ${
-                      tool === "cycle"
-                        ? "bg-white dark:bg-zinc-950 text-black dark:text-white shadow-sm"
-                        : "text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200"
-                    }`}
-                  >
-                    <RefreshCw className="h-3 w-3" />
-                    Cycle
-                  </button>
+            {/* BRUSH INTENSITY */}
+            {tool !== "eraser" && (
+              <div className="flex flex-col gap-2.5">
+                <span className="text-[13px] font-bold text-zinc-400">Brush Shade (Intensity):</span>
+                <div className="grid grid-cols-4 gap-2.5">
+                  {[1, 2, 3, 4].map((lvl) => {
+                    const commits = [0, 1, 3, 6, 10][lvl];
+                    const colorClass = 
+                      lvl === 1 ? "bg-[#0e4429]" :
+                      lvl === 2 ? "bg-[#006d32]" :
+                      lvl === 3 ? "bg-[#26a641]" : "bg-[#39d353]";
+
+                    return (
+                      <button
+                        key={lvl}
+                        onClick={() => setBrushLevel(lvl)}
+                        className={`
+                          py-2 rounded border transition-all flex items-center justify-center font-mono text-[12px] font-bold text-white
+                          ${colorClass}
+                          ${brushLevel === lvl ? "border-white scale-105 shadow" : "border-transparent hover:scale-102"}
+                        `}
+                      >
+                        {commits}
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
+            )}
+          </div>
 
-              {/* BRUSH INTENSITY SELECTOR */}
-              {tool !== "eraser" && (
-                <div className="flex flex-col gap-2 transition-all">
-                  <span className="text-xs font-bold text-zinc-400">Brush Intensity (Commits):</span>
-                  <div className="grid grid-cols-4 gap-2">
-                    {[1, 2, 3, 4].map((lvl) => {
-                      const commits = [0, 1, 3, 6, 10][lvl];
-                      let colorClass = "";
-                      if (isDarkMode) {
-                        colorClass = 
-                          lvl === 1 ? "bg-[#0e4429]" :
-                          lvl === 2 ? "bg-[#006d32]" :
-                          lvl === 3 ? "bg-[#26a641]" : "bg-[#39d353]";
-                      } else {
-                        colorClass = 
-                          lvl === 1 ? "bg-[#9be9a8]" :
-                          lvl === 2 ? "bg-[#40c463]" :
-                          lvl === 3 ? "bg-[#30a14e]" : "bg-[#216e39]";
-                      }
+          {/* COLUMN 2: TEXT DRAWER */}
+          <div className="border border-zinc-900 bg-zinc-950 p-5 rounded-lg shadow-sm flex flex-col gap-5">
+            <div className="border-b border-zinc-900 pb-2 flex items-center gap-2.5">
+              <Type className="h-5 w-5 text-zinc-400" />
+              <h2 className="text-sm font-semibold tracking-wider uppercase font-mono text-zinc-200">Text Drawer</h2>
+            </div>
 
-                      return (
+            <div className="flex flex-col gap-3.5">
+              {/* WORD INPUT */}
+              <div className="flex flex-col gap-2">
+                <label htmlFor="text-input" className="text-[13px] font-bold text-zinc-400">Word / Phrase:</label>
+                <input
+                  id="text-input"
+                  type="text"
+                  maxLength={15}
+                  value={textInput}
+                  onChange={(e) => setTextInput(e.target.value.replace(/[^A-Za-z0-9\s!\-+?]/g, ""))}
+                  placeholder="Enter text (e.g. HACK)"
+                  className="px-3 py-2 border border-zinc-800 bg-zinc-900 rounded text-sm font-mono focus:outline-none focus:border-zinc-700 text-white"
+                />
+                <span className="text-[12px] text-zinc-500 font-mono">A-Z, 0-9, space, ! - + ?</span>
+              </div>
+
+              {/* OFFSET SLIDER */}
+              <div className="flex flex-col gap-2">
+                <div className="flex items-center justify-between text-[13px]">
+                  <span className="font-bold text-zinc-400">Start Column:</span>
+                  <span className="font-mono text-zinc-300">{textOffset}</span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={Math.max(0, 53 - getTextWidth(textInput))}
+                  value={textOffset}
+                  disabled={autoCenter}
+                  onChange={(e) => setTextOffset(parseInt(e.target.value, 10))}
+                  className="w-full accent-white disabled:opacity-30 disabled:cursor-not-allowed"
+                />
+                
+                {/* AUTO CENTER */}
+                <label className="flex items-center gap-2.5 text-[12px] text-zinc-500 cursor-pointer mt-0.5 font-mono">
+                  <input
+                    type="checkbox"
+                    checked={autoCenter}
+                    onChange={(e) => setAutoCenter(e.target.checked)}
+                    className="accent-white rounded"
+                  />
+                  Auto-Center ({getTextWidth(textInput)} cols wide)
+                </label>
+              </div>
+
+              {/* RENDER BUTTON */}
+              <button
+                onClick={renderText}
+                disabled={!textInput.trim()}
+                className="w-full py-2.5 bg-white text-black rounded hover:opacity-90 font-semibold text-sm transition-colors flex items-center justify-center gap-2 disabled:opacity-30 disabled:cursor-not-allowed"
+              >
+                <Sparkles className="h-4 w-4" />
+                Render onto Grid
+              </button>
+            </div>
+          </div>
+
+          {/* COLUMN 3: PRESET SHAPES */}
+          <div className="border border-zinc-900 bg-zinc-950 p-5 rounded-lg shadow-sm flex flex-col gap-5">
+            <div className="border-b border-zinc-900 pb-2 flex items-center gap-2.5">
+              <Sparkles className="h-5 w-5 text-zinc-400" />
+              <h2 className="text-sm font-semibold tracking-wider uppercase font-mono text-zinc-200">Preset Shapes</h2>
+            </div>
+
+            <div className="flex flex-col gap-3">
+              <span className="text-[13px] font-bold text-zinc-400">Presets & Actions:</span>
+              <div className="grid grid-cols-2 gap-2.5">
+                <button
+                  onClick={drawSpaceInvader}
+                  className="py-1.5 border border-zinc-800 rounded hover:bg-zinc-900 text-[12px] font-mono text-zinc-300 hover:text-white"
+                >
+                  Invader
+                </button>
+                <button
+                  onClick={drawSmiley}
+                  className="py-1.5 border border-zinc-800 rounded hover:bg-zinc-900 text-[12px] font-mono text-zinc-300 hover:text-white"
+                >
+                  Smiley
+                </button>
+                <button
+                  onClick={fillGrid}
+                  className="py-1.5 border border-zinc-800 rounded hover:bg-zinc-900 text-[12px] font-mono text-zinc-300 hover:text-white"
+                >
+                  Fill All
+                </button>
+                <button
+                  onClick={randomGrid}
+                  className="py-1.5 border border-zinc-800 rounded hover:bg-zinc-900 text-[12px] font-mono text-zinc-300 hover:text-white"
+                >
+                  Random
+                </button>
+              </div>
+
+              {/* GAME OF LIFE SIMULATOR */}
+              <div className="flex flex-col gap-2 pt-2.5 border-t border-zinc-900">
+                <span className="text-[13px] font-bold text-zinc-400">Game of Life Simulator:</span>
+                <p className="text-[12px] text-zinc-500 leading-normal">
+                  Simulate Conway's Game of Life on grid.
+                </p>
+                <button
+                  onClick={runGameOfLifeStep}
+                  className="w-full py-1.5 border border-zinc-800 rounded hover:bg-zinc-900 text-[12px] font-mono text-zinc-300 hover:text-white flex items-center justify-center gap-2"
+                >
+                  <Play className="h-4 w-4" />
+                  Simulate Step
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* COLUMN 4: ACTION PANEL */}
+          <div className="border border-zinc-900 bg-zinc-955 rounded-lg shadow-sm flex flex-col overflow-hidden min-h-[396px]">
+            
+            {/* MINI TABS */}
+            <div className="flex border-b border-zinc-900 bg-zinc-900/30 text-[12px] font-mono uppercase tracking-wider">
+              <button
+                onClick={() => setActiveTab("github")}
+                className={`flex-1 py-2.5 font-bold transition-all relative border-r border-zinc-900 ${
+                  activeTab === "github" ? "text-emerald-400 bg-zinc-950" : "text-zinc-500 hover:text-zinc-300"
+                }`}
+              >
+                GitHub Push
+                <span className="absolute top-1 right-1 flex h-1.5 w-1.5">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-emerald-500"></span>
+                </span>
+              </button>
+              <button
+                onClick={() => setActiveTab("local")}
+                className={`flex-1 py-2.5 font-bold transition-all border-r border-zinc-900 ${
+                  activeTab === "local" ? "text-white bg-zinc-955" : "text-zinc-500 hover:text-zinc-300"
+                }`}
+              >
+                Local Apply
+              </button>
+              <button
+                onClick={() => setActiveTab("scripts")}
+                className={`flex-1 py-2.5 font-bold transition-all border-r border-zinc-900 ${
+                  activeTab === "scripts" ? "text-white bg-zinc-955" : "text-zinc-500 hover:text-zinc-300"
+                }`}
+              >
+                Scripts
+              </button>
+              <button
+                onClick={() => setActiveTab("io")}
+                className={`flex-1 py-2.5 font-bold transition-all ${
+                  activeTab === "io" ? "text-white bg-zinc-955" : "text-zinc-500 hover:text-zinc-300"
+                }`}
+              >
+                JSON
+              </button>
+            </div>
+
+            {/* TAB CONTENT (COMPACTED) */}
+            <div className="p-5 flex-1 flex flex-col justify-start">
+              
+              {/* TAB: GITHUB DIRECT PUSH */}
+              {activeTab === "github" && (
+                <div className="flex flex-col gap-3.5 flex-1">
+                  <div className="flex flex-col">
+                    <h3 className="text-[12px] font-semibold text-zinc-200 font-mono uppercase tracking-wide">GitHub Push</h3>
+                    <p className="text-[10px] text-zinc-500">
+                      Creates a repo on your profile and pushes the backdated commits to it.
+                    </p>
+                  </div>
+
+                  {!ghUser ? (
+                    <div className="flex flex-col gap-3.5 flex-1 justify-center">
+                      <div className="flex flex-col gap-2">
+                        <label htmlFor="gh-token-input" className="text-[12px] font-bold text-zinc-400">
+                          Personal Access Token (PAT):
+                        </label>
+                        <input
+                          id="gh-token-input"
+                          type="password"
+                          value={ghToken}
+                          onChange={(e) => setGhToken(e.target.value)}
+                          placeholder="ghp_xxxx"
+                          className="px-3 py-2 border border-zinc-800 bg-zinc-900 rounded text-sm font-mono focus:outline-none focus:border-zinc-700 text-white"
+                        />
+                        <p className="text-[11px] text-zinc-500 leading-normal mt-0.5">
+                          Create a token with the <strong className="text-zinc-400">repo</strong> scope. Use <a href="https://github.com/settings/tokens" target="_blank" rel="noopener noreferrer" className="underline hover:text-white">github.com/settings/tokens</a>.
+                        </p>
+                      </div>
+
+                      <button
+                        onClick={handleGHAuthenticate}
+                        disabled={isGHAuthenticating || !ghToken.trim()}
+                        className="w-full py-2 bg-white text-black font-semibold text-sm rounded hover:opacity-90 transition-colors disabled:opacity-30 disabled:cursor-not-allowed flex items-center justify-center gap-1.5"
+                      >
+                        {isGHAuthenticating ? (
+                          <>
+                            <RefreshCw className="h-4 w-4 animate-spin" />
+                            Connecting...
+                          </>
+                        ) : (
+                          <>
+                            <Check className="h-4 w-4" />
+                            Connect GitHub
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="flex flex-col gap-3.5 flex-1">
+                      {/* USER PROFILE INFO */}
+                      <div className="flex items-center justify-between border border-zinc-900 p-2.5 rounded bg-zinc-900/40">
+                        <div className="flex items-center gap-2.5">
+                          {ghUser.avatarUrl ? (
+                            <img src={ghUser.avatarUrl} alt={ghUser.name} className="w-7 h-7 rounded-full border border-zinc-850" />
+                          ) : (
+                            <div className="w-7 h-7 rounded-full bg-zinc-800 flex items-center justify-center text-[12px] font-bold text-white">
+                              {ghUser.username.substring(0, 2).toUpperCase()}
+                            </div>
+                          )}
+                          <div className="flex flex-col">
+                            <span className="text-[12px] font-semibold text-zinc-200 leading-none">{ghUser.name}</span>
+                            <span className="text-[11px] font-mono text-zinc-500 mt-0.5">@{ghUser.username}</span>
+                          </div>
+                        </div>
+                        
                         <button
-                          key={lvl}
-                          onClick={() => setBrushLevel(lvl)}
-                          className={`
-                            aspect-square rounded-[3px] border-2 transition-all flex flex-col items-center justify-center relative group
-                            ${colorClass}
-                            ${brushLevel === lvl 
-                              ? "border-black dark:border-white scale-110 shadow-sm" 
-                              : "border-transparent hover:scale-105"}
-                          `}
+                          onClick={handleGHDisconnect}
+                          className="text-[11px] font-mono text-rose-455 hover:underline"
                         >
-                          <span className="text-[10px] font-bold text-white drop-shadow-md">{commits}</span>
+                          Disconnect
                         </button>
-                      );
-                    })}
+                      </div>
+
+                      {/* REPO CONFIG */}
+                      <div className="flex flex-col gap-1.5">
+                        <label htmlFor="gh-repo-input" className="text-[12px] font-bold text-zinc-400">Repository Name:</label>
+                        <input
+                          id="gh-repo-input"
+                          type="text"
+                          value={ghRepoName}
+                          onChange={(e) => setGhRepoName(e.target.value.replace(/[^a-zA-Z0-9_\-\.]/g, "-"))}
+                          placeholder="hackgit-contributions"
+                          className="px-3 py-1.5 border border-zinc-800 bg-zinc-900 rounded text-sm font-mono focus:outline-none focus:border-zinc-700 text-white"
+                        />
+                        <p className="text-[11px] text-zinc-500 font-mono mt-0.5">
+                          github.com/{ghUser.username}/{ghRepoName || "repo"}
+                        </p>
+                      </div>
+
+                      {/* PUSH BUTTON */}
+                      <button
+                        onClick={handleGHPush}
+                        disabled={isGHPushing || activeCells.length === 0}
+                        className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-sm rounded transition-all disabled:opacity-30 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                      >
+                        {isGHPushing ? (
+                          <>
+                            <RefreshCw className="h-4 w-4 animate-spin" />
+                            Pushing...
+                          </>
+                        ) : (
+                          <>
+                            <GitCommit className="h-4 w-4" />
+                            Push {totalCommits} Commits
+                          </>
+                        )}
+                      </button>
+
+                      {/* PUSH RESULT MESSAGE */}
+                      {ghPushResult && (
+                        <div className={`p-2.5 rounded border text-[12px] leading-relaxed ${
+                          ghPushResult.success 
+                            ? "bg-emerald-950/20 border-emerald-900/50 text-emerald-400"
+                            : "bg-rose-950/20 border-rose-900/50 text-rose-400"
+                        }`}>
+                          {ghPushResult.success ? (
+                            <div className="flex flex-col gap-1">
+                              <span className="font-bold flex items-center gap-1">
+                                <Check className="h-3 w-3 text-emerald-400" />
+                                Done! Pushed to GitHub.
+                              </span>
+                              <span className="text-[9px] text-zinc-400">
+                                ⚠️ Note: It takes 3-10 mins for GitHub to index commits.
+                              </span>
+                              <a
+                                href={ghPushResult.repoUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="underline hover:no-underline font-mono text-[11px] text-white"
+                              >
+                                View Repo
+                              </a>
+                            </div>
+                          ) : (
+                            <div className="flex flex-col">
+                              <span className="font-bold">Push Failed:</span>
+                              <span className="font-mono text-[9px]">{ghPushResult.error}</span>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* TAB: LOCAL DIRECT COMMIT */}
+              {activeTab === "local" && (
+                <div className="flex flex-col gap-3.5 flex-1">
+                  <div className="flex flex-col">
+                    <h3 className="text-[12px] font-semibold text-zinc-200 font-mono uppercase tracking-wide">Local Apply</h3>
+                    <p className="text-[10px] text-zinc-500">
+                      Writes commits directly into this local folder.
+                    </p>
+                  </div>
+
+                  {/* LOCAL REPO STATUS */}
+                  <div className="bg-zinc-900/40 border border-zinc-900 rounded p-2 flex items-center justify-between">
+                    <div className="flex flex-col gap-1 font-mono text-[10px] text-zinc-400">
+                      <div className="flex items-center gap-1.5">
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
+                        <span>Repo: <strong>hackgit</strong></span>
+                      </div>
+                      {gitStatus?.success ? (
+                        <>
+                          <div>Branch: <strong>{gitStatus.branch}</strong></div>
+                          <div>Clean: <strong>{gitStatus.isClean ? "Yes" : "No"}</strong></div>
+                        </>
+                      ) : (
+                        <div className="text-rose-500">{gitStatus?.error || "Checking git..."}</div>
+                      )}
+                    </div>
+                    <button
+                      onClick={fetchGitStatus}
+                      className="px-2.5 py-1 text-[10px] border border-zinc-800 rounded hover:bg-zinc-900 font-mono text-zinc-400 hover:text-white"
+                    >
+                      Refresh
+                    </button>
+                  </div>
+
+                  {/* RUN COMMIT BUTTON */}
+                  <button
+                    onClick={handleApplyCommits}
+                    disabled={isCommitting || activeCells.length === 0}
+                    className="w-full py-2 bg-white text-black font-semibold text-sm rounded transition-all hover:opacity-90 disabled:opacity-30 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                  >
+                    {isCommitting ? (
+                      <>
+                        <RefreshCw className="h-4 w-4 animate-spin" />
+                        Committing...
+                      </>
+                    ) : (
+                      <>
+                        <GitCommit className="h-4 w-4" />
+                        Apply {totalCommits} Commits
+                      </>
+                    )}
+                  </button>
+                  
+                  {commitMessage && (
+                    <div className={`p-2 rounded border text-[10px] font-mono leading-relaxed max-h-20 overflow-y-auto ${
+                      commitSuccess === true 
+                        ? "bg-emerald-950/20 border-emerald-900/50 text-emerald-400"
+                        : commitSuccess === false
+                        ? "bg-rose-950/20 border-rose-900/50 text-rose-400"
+                        : "bg-zinc-900 border-zinc-800 text-zinc-400"
+                    }`}>
+                      {commitMessage}
+                    </div>
+                  )}
+
+                  <div className="text-[9px] text-zinc-500 leading-normal border-t border-zinc-900 pt-2 flex flex-col gap-1">
+                    <span>• Writes backdated commits using <code>data.json</code>.</span>
+                    <span>• Commits on a separate branch are recommended.</span>
+                  </div>
+                </div>
+              )}
+
+              {/* TAB: EXPORT SCRIPTS */}
+              {activeTab === "scripts" && (
+                <div className="flex flex-col gap-3.5 flex-1">
+                  <div className="flex flex-col">
+                    <h3 className="text-[12px] font-semibold text-zinc-200 font-mono uppercase tracking-wide">Export Scripts</h3>
+                    <p className="text-[10px] text-zinc-505">
+                      Copy scripts to run on another repository.
+                    </p>
+                  </div>
+
+                  {activeCells.length === 0 ? (
+                    <div className="border border-dashed border-zinc-900 rounded p-5 text-center text-[11px] text-zinc-500 flex-1 flex items-center justify-center">
+                      Select cells on the calendar grid first.
+                    </div>
+                  ) : (
+                    <div className="flex flex-col gap-2.5 flex-1">
+                      
+                      {/* BASH SCRIPT CONTAINER */}
+                      <div className="flex flex-col gap-1 border border-zinc-900 rounded p-2 bg-zinc-900/10">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[10px] font-bold font-mono text-zinc-500">Bash (Mac/Linux)</span>
+                          <div className="flex gap-1.5">
+                            <button
+                              onClick={() => copyToClipboard(getBashScriptText(), "bash")}
+                              className="px-1.5 py-0.5 text-[10px] border border-zinc-800 hover:bg-zinc-900 rounded font-mono text-zinc-400 hover:text-white flex items-center gap-1"
+                            >
+                              {copiedBash ? <Check className="h-3 w-3 text-emerald-500" /> : <Copy className="h-3 w-3" />}
+                              Copy
+                            </button>
+                            <button
+                              onClick={() => downloadScriptFile(getBashScriptText(), "hackgit-commits.sh")}
+                              className="px-1.5 py-0.5 text-[10px] border border-zinc-800 hover:bg-zinc-900 rounded font-mono text-zinc-400 hover:text-white flex items-center gap-1"
+                            >
+                              <Download className="h-3.5 w-3.5" />
+                              Save
+                            </button>
+                          </div>
+                        </div>
+                        <pre className="p-1 bg-zinc-955 border border-zinc-900 rounded text-zinc-400 text-[10px] overflow-auto max-h-16 font-mono leading-relaxed font-semibold">
+                          {getBashScriptText().substring(0, 80)}...
+                        </pre>
+                      </div>
+
+                      {/* POWERSHELL SCRIPT CONTAINER */}
+                      <div className="flex flex-col gap-1 border border-zinc-900 rounded p-2 bg-zinc-900/10">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[10px] font-bold font-mono text-zinc-500">PowerShell (Win)</span>
+                          <div className="flex gap-1.5">
+                            <button
+                              onClick={() => copyToClipboard(getPowerShellScriptText(), "powershell")}
+                              className="px-1.5 py-0.5 text-[10px] border border-zinc-800 hover:bg-zinc-900 rounded font-mono text-zinc-400 hover:text-white flex items-center gap-1"
+                            >
+                              {copiedPowerShell ? <Check className="h-3 w-3 text-emerald-500" /> : <Copy className="h-3 w-3" />}
+                              Copy
+                            </button>
+                            <button
+                              onClick={() => downloadScriptFile(getPowerShellScriptText(), "powershell")}
+                              className="px-1.5 py-0.5 text-[10px] border border-zinc-850 hover:bg-zinc-900 rounded font-mono text-zinc-400 hover:text-white flex items-center gap-1"
+                            >
+                              <Download className="h-3 w-3" />
+                              Save
+                            </button>
+                          </div>
+                        </div>
+                        <pre className="p-1 bg-zinc-955 border border-zinc-900 rounded text-zinc-400 text-[10px] overflow-auto max-h-16 font-mono leading-relaxed font-semibold">
+                          {getPowerShellScriptText().substring(0, 80)}...
+                        </pre>
+                      </div>
+
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* TAB: IMPORT/EXPORT JSON */}
+              {activeTab === "io" && (
+                <div className="flex flex-col gap-3.5 flex-1">
+                  <div className="flex flex-col">
+                    <h3 className="text-[12px] font-semibold text-zinc-200 font-mono uppercase tracking-wide">Import/Export JSON</h3>
+                    <p className="text-[10px] text-zinc-505 font-mono">
+                      Save/load contribution patterns as files.
+                    </p>
+                  </div>
+
+                  <div className="flex flex-col gap-2.5 mt-2.5 flex-1 justify-center font-semibold">
+                    {/* EXPORT */}
+                    <div className="flex flex-col gap-1.5">
+                      <button
+                        onClick={handleExportJSON}
+                        disabled={activeCells.length === 0}
+                        className="w-full py-1.5 border border-zinc-800 rounded hover:bg-zinc-900 transition-colors text-[11px] font-semibold flex items-center justify-center gap-1.5 disabled:opacity-30 disabled:cursor-not-allowed text-zinc-200"
+                      >
+                        <Download className="h-4 w-4" />
+                        Download JSON Pattern
+                      </button>
+                    </div>
+
+                    {/* IMPORT */}
+                    <div className="flex flex-col gap-1.5">
+                      <label className="w-full py-1.5 border border-zinc-800 rounded hover:bg-zinc-900 transition-colors text-[11px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer text-center text-zinc-200 font-semibold">
+                        <Upload className="h-4 w-4" />
+                        <span>Upload JSON Pattern</span>
+                        <input
+                          type="file"
+                          accept=".json"
+                          onChange={handleImportJSON}
+                          className="hidden"
+                        />
+                      </label>
+                    </div>
                   </div>
                 </div>
               )}
 
             </div>
-
-            {/* PANEL: TEXT MAKER TOOL */}
-            <div className="border border-zinc-200 dark:border-zinc-900 bg-white dark:bg-zinc-950 p-6 rounded-lg shadow-sm flex flex-col gap-5">
-              
-              <div className="border-b border-zinc-100 dark:border-zinc-900 pb-3 flex items-center gap-2">
-                <Type className="h-4 w-4" />
-                <h2 className="text-sm font-semibold tracking-wider uppercase font-mono">Text Drawer</h2>
-              </div>
-
-              <div className="flex flex-col gap-4">
-                
-                {/* TEXT INPUT */}
-                <div className="flex flex-col gap-1.5">
-                  <label htmlFor="text-input" className="text-xs font-bold text-zinc-400">Word / Phrase:</label>
-                  <input
-                    id="text-input"
-                    type="text"
-                    maxLength={15}
-                    value={textInput}
-                    onChange={(e) => setTextInput(e.target.value.replace(/[^A-Za-z0-9\s!\-+?]/g, ""))}
-                    placeholder="Enter text (e.g. HACK)"
-                    className="px-3 py-1.5 border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900 rounded text-sm font-mono focus:outline-none focus:border-zinc-900 dark:focus:border-white"
-                  />
-                  <span className="text-[9px] text-zinc-400">Supported: A-Z, 0-9, space, ! - + ?</span>
-                </div>
-
-                {/* TEXT COL OFFSET */}
-                <div className="flex flex-col gap-1.5">
-                  <div className="flex items-center justify-between text-xs">
-                    <span className="font-bold text-zinc-400">Start Column Offset:</span>
-                    <span className="font-mono text-zinc-950 dark:text-zinc-50">{textOffset}</span>
-                  </div>
-                  <input
-                    type="range"
-                    min={0}
-                    max={Math.max(0, 53 - getTextWidth(textInput))}
-                    value={textOffset}
-                    disabled={autoCenter}
-                    onChange={(e) => setTextOffset(parseInt(e.target.value, 10))}
-                    className="w-full accent-black dark:accent-white disabled:opacity-30 disabled:cursor-not-allowed"
-                  />
-                  
-                  {/* AUTO CENTER TOGGLE */}
-                  <label className="flex items-center gap-2 text-xs text-zinc-500 cursor-pointer mt-1 font-mono">
-                    <input
-                      type="checkbox"
-                      checked={autoCenter}
-                      onChange={(e) => setAutoCenter(e.target.checked)}
-                      className="accent-black dark:accent-white rounded"
-                    />
-                    Auto-Center text ({getTextWidth(textInput)} cols wide)
-                  </label>
-                </div>
-
-                <button
-                  onClick={renderText}
-                  disabled={!textInput.trim()}
-                  className="w-full py-2 bg-zinc-900 text-white dark:bg-white dark:text-black rounded hover:opacity-90 font-semibold text-xs transition-colors flex items-center justify-center gap-1.5 disabled:opacity-30 disabled:cursor-not-allowed"
-                >
-                  <Sparkles className="h-3.5 w-3.5" />
-                  Render Word onto Grid
-                </button>
-
-              </div>
-
-            </div>
-
-            {/* PANEL: PRESETS & EASTER EGGS */}
-            <div className="border border-zinc-200 dark:border-zinc-900 bg-white dark:bg-zinc-950 p-6 rounded-lg shadow-sm flex flex-col gap-4">
-              
-              <div className="border-b border-zinc-100 dark:border-zinc-900 pb-3 flex items-center gap-2">
-                <Sparkles className="h-4 w-4" />
-                <h2 className="text-sm font-semibold tracking-wider uppercase font-mono">Preset Shapes</h2>
-              </div>
-
-              <div className="grid grid-cols-2 gap-2">
-                <button
-                  onClick={drawSpaceInvader}
-                  className="py-1.5 border border-zinc-200 dark:border-zinc-800 rounded hover:bg-zinc-100 dark:hover:bg-zinc-900 text-xs font-mono font-medium transition-colors"
-                >
-                  👾 Invader
-                </button>
-                <button
-                  onClick={drawSmiley}
-                  className="py-1.5 border border-zinc-200 dark:border-zinc-800 rounded hover:bg-zinc-100 dark:hover:bg-zinc-900 text-xs font-mono font-medium transition-colors"
-                >
-                  🙂 Smiley
-                </button>
-              </div>
-
-              <div className="border-b border-zinc-100 dark:border-zinc-900 pb-1.5 pt-2 flex items-center gap-2">
-                <RefreshCw className="h-3.5 w-3.5 text-zinc-400" />
-                <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400 font-mono">Grid Utilities</span>
-              </div>
-
-              <div className="grid grid-cols-2 gap-2">
-                <button
-                  onClick={fillGrid}
-                  className="py-1.5 border border-zinc-200 dark:border-zinc-800 rounded hover:bg-zinc-100 dark:hover:bg-zinc-900 text-xs font-mono font-medium transition-colors"
-                >
-                  ⬛ Fill All
-                </button>
-                <button
-                  onClick={invertGrid}
-                  className="py-1.5 border border-zinc-200 dark:border-zinc-800 rounded hover:bg-zinc-100 dark:hover:bg-zinc-900 text-xs font-mono font-medium transition-colors"
-                >
-                  🌓 Invert
-                </button>
-                <button
-                  onClick={randomGrid}
-                  className="py-1.5 border border-zinc-200 dark:border-zinc-800 rounded hover:bg-zinc-100 dark:hover:bg-zinc-900 text-xs font-mono font-medium transition-colors"
-                >
-                  🎲 Random
-                </button>
-                <button
-                  onClick={clearGrid}
-                  className="py-1.5 border border-zinc-200 dark:border-zinc-850 bg-rose-50/10 hover:bg-rose-500/20 text-rose-600 dark:text-rose-400 rounded text-xs font-mono font-medium transition-colors flex items-center justify-center gap-1"
-                >
-                  <Trash2 className="h-3 w-3" />
-                  Clear Grid
-                </button>
-              </div>
-
-              {/* GAME OF LIFE SIMULATOR */}
-              <div className="border-b border-zinc-100 dark:border-zinc-900 pb-1.5 pt-2 flex items-center gap-2">
-                <Play className="h-3.5 w-3.5 text-zinc-400" />
-                <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400 font-mono">Life Simulator</span>
-              </div>
-
-              <div className="flex flex-col gap-2">
-                <p className="text-[10px] text-zinc-400 leading-relaxed leading-normal">
-                  Treat the contribution calendar as a Conway's Game of Life board! Click the step button to run a step of the simulation.
-                </p>
-                <button
-                  onClick={runGameOfLifeStep}
-                  className="w-full py-1.5 border border-zinc-200 dark:border-zinc-800 rounded hover:bg-zinc-100 dark:hover:bg-zinc-900 text-xs font-mono font-medium transition-colors flex items-center justify-center gap-1"
-                >
-                  <Play className="h-3 w-3" />
-                  Simulate Step
-                </button>
-              </div>
-
-            </div>
-
           </div>
-
         </div>
-
       </div>
     </div>
   );
