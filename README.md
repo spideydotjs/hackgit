@@ -1,36 +1,43 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# hackgit 👾
+
+An interactive, clean, and minimal monochrome design tool to draw custom patterns and text directly onto your GitHub contribution heatmap calendar.
+
+## Features
+
+- **Interactive Heatmap Editor:** A 53-week × 7-day replica of the GitHub contribution calendar. Click and drag to draw or erase cells.
+- **Draw Tools:** Switch between *Draw* (paint with intensity), *Erase* (reset cell to 0), and *Cycle* (rotate through 0–4 contribution levels).
+- **Brush Intensity:** Choose from 4 contribution levels (1, 3, 6, or 10 commits per day) to design varying shades of green.
+- **Text Drawer:** Enter any word or phrase and automatically render it onto the grid. Includes auto-centering and column offsets.
+- **Preset Shapes:** Renders built-in pixel patterns, including a classic *Space Invader* or *Smiley Face*.
+- **Conway's Game of Life:** Use the contribution calendar as an interactive Life simulator. Step through generations to observe cellular automata patterns.
+- **Direct Local Commit (Server Actions):** Apply the planned contributions directly to your local Git repository in real-time.
+- **Script Generation:** Generate and download fully-compatible, portable **Bash** (macOS/Linux) or **PowerShell** (Windows) scripts to execute the backdated commits on any other Git repository.
+- **Import/Export:** Save your canvas layout as a JSON file and import it back to edit later.
+- **Responsive & Dual Theme:** High-fidelity minimal monochrome UI supporting both Light and Dark mode options.
 
 ## Getting Started
 
-First, run the development server:
+### Prerequisites
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
+Make sure you have Node.js and Git installed.
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+### Setup and Running
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+1. **Install Dependencies:**
+   ```bash
+   npm install
+   ```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+2. **Run the Development Server:**
+   ```bash
+   npm run dev
+   ```
 
-## Learn More
+3. **Open in Browser:**
+   Go to [http://localhost:3000](http://localhost:3050) (or whichever port Next.js starts on) to start drawing!
 
-To learn more about Next.js, take a look at the following resources:
+## How It Works Under the Hood
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+The application calculates calendar coordinates relative to the Sunday of the week 52 weeks ago. When a commit is scheduled, `hackgit` writes a state update to a `data.json` file and commits it using backdated system timestamps (overriding the `GIT_AUTHOR_DATE` and `GIT_COMMITTER_DATE` environment variables).
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Happy hacking! 🚀
